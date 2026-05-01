@@ -25,6 +25,8 @@ from tabicl import InferenceConfig
 from tabicl._model.tabicl import TabICL
 from tabicl._model.kv_cache import TabICLCache
 
+import nnsight
+
 
 class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
     """Tabular In-Context Learning (TabICL) Classifier with scikit-learn interface.
@@ -297,6 +299,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        nnsight: bool = False,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -320,6 +323,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.nnsight = nnsight
 
     def _load_model(self) -> None:
         """Load a model from a given path or download it if not available.
@@ -409,9 +413,13 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
+        self.tabicl_model_ = TabICL(**checkpoint["config"])
         self.model_config_ = checkpoint["config"]
-        self.model_.load_state_dict(checkpoint["state_dict"])
+        self.tabicl_model_.load_state_dict(checkpoint["state_dict"])
+        if self.nnsight:
+            self.model_ = nnsight.NNsight(self.tabicl_model_)
+        else:
+            self.model_ = self.tabicl_model_
         self.model_.eval()
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> TabICLClassifier:
@@ -819,6 +827,109 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         y = np.argmax(proba, axis=1)
 
         return self.y_encoder_.inverse_transform(y)
+
+    def get_tracer(
+        self,
+        X_test: np.ndarray,
+        estimator_idx: int = 0,
+        norm_method: Optional[str] = None,
+        return_logits: bool = True,
+        softmax_temperature: Optional[float] = None,
+    ):
+        """Get a single-input wrapper around TabICL for nnsight interpretability.
+
+        Preprocesses ``X_test`` and picks one ensemble member, then returns a
+        :class:`~tabicl.TabICLTracer` whose ``forward(X_test_tensor)`` accepts a
+        single tensor. This makes the model compatible with nnsight's tracing
+        context, which expects one input argument.
+
+        Parameters
+        ----------
+        X_test : array-like of shape (n_samples, n_features)
+            Test samples to interpret. Preprocessed using the fitted encoders.
+
+        estimator_idx : int, default=0
+            Index of the ensemble member to use within the chosen ``norm_method``.
+
+        norm_method : str or None, default=None
+            Normalization method to select. If None, uses the first available.
+
+        return_logits : bool, default=True
+            Passed through to ``TabICL.forward()``.
+
+        softmax_temperature : float or None, default=None
+            Temperature for softmax. If None, uses ``self.softmax_temperature``.
+
+        Returns
+        -------
+        tracer : TabICLTracer or nnsight.NNsight
+            Module whose ``forward(X_test_tensor)`` takes a single preprocessed
+            tensor. Wrapped in ``nnsight.NNsight`` when ``self.nnsight=True``,
+            enabling nnsight activation access on ``tracer.model.*``.
+
+        X_test_tensor : torch.Tensor of shape (1, n_samples, n_features)
+            Preprocessed test features for the selected estimator, ready to
+            pass to ``tracer.trace(X_test_tensor)`` (or call directly).
+
+        Examples
+        --------
+        >>> clf = TabICLClassifier(nnsight=True)
+        >>> clf.fit(X_train, y_train)
+        >>> tracer, X_test_t = clf.get_tracer(X_test)
+        >>> with tracer.trace(X_test_t):
+        ...     col_emb = tracer.model.col_embedder.output.save()
+        ...     row_rep = tracer.model.row_interactor.output.save()
+        ...     out = tracer.output.save()
+        """
+        from tabicl._model.tabicl import TabICLTracer
+
+        check_is_fitted(self)
+
+        X_test = validate_data(self, X_test, reset=False, dtype=None, skip_check_array=True)
+        X_test = self.X_encoder_.transform(X_test)
+
+        data = self.ensemble_generator_.transform(X_test, mode="both")
+
+        if norm_method is None:
+            norm_method = next(iter(data))
+        elif norm_method not in data:
+            raise ValueError(
+                f"norm_method {norm_method!r} not found. Available: {list(data)}"
+            )
+
+        Xs, ys = data[norm_method]  # (n_variants, T, H), (n_variants, train_size)
+        feature_shuffles_all = self.ensemble_generator_.feature_shuffles_[norm_method]
+
+        if estimator_idx >= len(Xs):
+            raise ValueError(
+                f"estimator_idx={estimator_idx} out of range for norm_method={norm_method!r} "
+                f"which has {len(Xs)} variants."
+            )
+
+        X = Xs[estimator_idx]  # (T, H)
+        y = ys[estimator_idx]  # (train_size,)
+        feat_shuffle = feature_shuffles_all[estimator_idx]
+
+        train_size = y.shape[0]
+        X_train_t = torch.from_numpy(X[:train_size]).float().unsqueeze(0).to(self.device_)
+        y_train_t = torch.from_numpy(y).float().unsqueeze(0).to(self.device_)
+        X_test_t = torch.from_numpy(X[train_size:]).float().unsqueeze(0).to(self.device_)
+
+        tracer = TabICLTracer(
+            model=self.tabicl_model_,
+            X_train=X_train_t,
+            y_train=y_train_t,
+            feature_shuffles=[feat_shuffle],
+            return_logits=return_logits,
+            softmax_temperature=softmax_temperature if softmax_temperature is not None else self.softmax_temperature,
+            inference_config=self.inference_config_,
+        )
+        tracer.eval()
+
+        if self.nnsight:
+            tracer = nnsight.NNsight(tracer)
+
+        return tracer, X_test_t
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()

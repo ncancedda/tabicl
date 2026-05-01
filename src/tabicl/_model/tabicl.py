@@ -897,3 +897,77 @@ class TabICL(nn.Module):
             return results[output_type[0]]
 
         return results
+
+
+class TabICLTracer(nn.Module):
+    """Single-input wrapper around TabICL for nnsight interpretability.
+
+    Stores the training context (X_train, y_train) as buffers and exposes a
+    ``forward(X_test)`` that accepts a single tensor, making the model
+    compatible with nnsight's tracing context which expects one input.
+
+    Do not instantiate directly; use ``TabICLClassifier.get_tracer()`` instead,
+    which handles all preprocessing and returns both the tracer and the
+    ready-to-use test tensor.
+
+    Parameters
+    ----------
+    model : TabICL
+        The underlying TabICL model (unwrapped, not an NNsight object).
+    X_train : Tensor of shape (1, train_size, H)
+        Preprocessed training features for a single ensemble member.
+    y_train : Tensor of shape (1, train_size)
+        Training labels for the same ensemble member.
+    feature_shuffles : list of list of int or None
+        Feature permutation pattern(s) for the selected ensemble member,
+        wrapped in an outer list to match the batch dimension.
+    return_logits : bool, default=True
+        Passed through to ``TabICL.forward()``.
+    softmax_temperature : float, default=0.9
+        Passed through to ``TabICL.forward()``.
+    inference_config : InferenceConfig or None
+        Passed through to ``TabICL.forward()``.
+    """
+
+    def __init__(
+        self,
+        model: TabICL,
+        X_train: Tensor,
+        y_train: Tensor,
+        feature_shuffles: Optional[List[List[int]]] = None,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        inference_config: Optional[InferenceConfig] = None,
+    ):
+        super().__init__()
+        self.model = model
+        self.register_buffer("X_train_ctx", X_train)
+        self.register_buffer("y_train_ctx", y_train)
+        self.feature_shuffles = feature_shuffles
+        self.return_logits = return_logits
+        self.softmax_temperature = softmax_temperature
+        self.inference_config = inference_config
+
+    def forward(self, X_test: Tensor) -> Tensor:
+        """Run TabICL on X_test using the stored training context.
+
+        Parameters
+        ----------
+        X_test : Tensor of shape (1, test_size, H)
+            Preprocessed test features using the same normalization and
+            feature-shuffle as the stored training context.
+
+        Returns
+        -------
+        Tensor of shape (1, test_size, out_dim)
+            Model output for the test samples only.
+        """
+        X = torch.cat([self.X_train_ctx, X_test], dim=1)
+        return self.model(
+            X,
+            self.y_train_ctx,
+            feature_shuffles=self.feature_shuffles,
+            return_logits=self.return_logits,
+            softmax_temperature=self.softmax_temperature,
+            inference_config=self.inference_config,
+        )

@@ -5,5 +5,5 @@
 ``InferenceConfig`` is re-exported at :class:`tabicl.InferenceConfig`.
 """
 
-from .tabicl import TabICL
+from .tabicl import TabICL, TabICLTracer
 from .inference_config import InferenceConfig

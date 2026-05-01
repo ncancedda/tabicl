@@ -1,4 +1,4 @@
-from ._model import InferenceConfig
+from ._model import InferenceConfig, TabICLTracer
 from ._sklearn import TabICLClassifier, TabICLRegressor
 
 __all__ = [
@@ -7,6 +7,7 @@ __all__ = [
     "TabICLForecaster",
     "TabICLUnsupervised",
     "InferenceConfig",
+    "TabICLTracer",
 ]
 
 
